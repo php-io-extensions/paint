@@ -1,0 +1,14 @@
+# Agent guidance — php-io-extensions/paint
+
+1. **Read [`.okf/index.md`](.okf/index.md) first** before changing the API, the C, or packaging. Open only the concepts the change touches.
+2. **Shapes into pixels, nothing else.** `PaintSurface` is 32-bit pixels and `fill()` paints ops into them, in a colour or a gradient. No windows, no fonts, no images, no drawing state (transforms, layers), no dependency, no framework names. See [`.okf/api/surface.md`](.okf/api/surface.md).
+3. **Plain C on the Zend API.** No Zephir, no FFI, no system library. `src/core.{h,c}` is plain C with no Zend in it; `src/PaintSurface.c` reads ops out of PHP arrays and calls it; `src/paint.c` is the module.
+4. **One scan for every shape.** A shape answers, for a sample line, where the line is inside it; `scan()` in `core.c` turns those intervals into coverage. A new shape is a new `across` function, not a new rasterizer.
+5. **The arithmetic is a contract.** Coverage is IEEE double with `+ − × ÷`, `floor`, `ceil`, `fabs` and `sqrt` in the order [`.okf/api/surface.md`](.okf/api/surface.md) writes down; blending is whole-number division. The same input answers the same bytes on every platform and from a PHP implementation of the same steps. A change to it changes every caller's output: it needs its reason, and its tests work the expected pixels by hand. The one exception is a radial gradient's `hypot`, which C libraries may round differently in the last bit.
+6. **`-ffp-contract=off` stays in `config.m4`.** Without it the compiler fuses multiply-adds in `core.c` and the bytes move. Check with `objdump -d src/.libs/core.o | grep -c fmadd`: 0.
+7. **Refuse, don't guess.** A number that is not finite or is past `PAINT_LIMIT`, an op that is not a list with a kind, a paint that is not a colour or a gradient, is a `ValueError` naming the op. The ops before it have been painted: `fill()` reads and paints one op at a time.
+8. **Memory it does not own is trusted.** `PaintSurface::over()` takes an address; it checks the sizes and nothing else, keeps the owner alive, and never frees the bytes. Every pixel written is inside the rect cut to the surface.
+9. **NTS and ZTS.** No module globals. Every change builds with `-Wall -Wextra` without a warning from `src/` and passes Pest under NTS and ZTS on macOS and Linux.
+10. **Tests are Pest v4 and hardware-free.** Expected pixels are worked by hand from the coverage and blend rules.
+11. **Durable facts go in `.okf`.** Update the matching concept, bump its `generated.at`, append `.okf/log.md`. The bundle documents the package, never a session.
+12. **Version**: `PHP_PAINT_VERSION` moves only past a published tag; tags drive Packagist.
