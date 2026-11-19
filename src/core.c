@@ -1,13 +1,29 @@
 /*
- * Shapes into pixels. Every shape is scanned the same way: for each sample
- * line the shape says where the line is inside it, as intervals of x. With
- * hard edges there is one sample line a row, through the pixel centres, and
- * a pixel is in when its centre is. Anti-aliased, there are PAINT_SAMPLES
- * lines a row; each interval adds the exact width it covers of each pixel,
- * so a pixel's coverage is the area of it inside the shape.
+ * Shapes into pixels.
+ *
+ * Anti-aliased, a pixel's coverage is the area of it inside the shape, by exact
+ * area: nothing is sampled. A shape is given as its boundary, straight pieces
+ * and arcs of ellipses, each with the winding it adds to everything on its
+ * right. A piece that passes through a pixel adds, for the part of the row it
+ * spans,
+ *
+ *     height - moment   to that pixel         moment = integral of (x(y) - pixel's left side) dy
+ *     moment            to the pixel after
+ *
+ * so the running sum of a row, left to right, is each pixel's covered area
+ * times its winding. For a straight piece the moment is height x the mean of
+ * x; for an arc x = cx +- rx sqrt(1 - u^2), u = (y - cy) / ry, it is the area
+ * under a circle, rx ry (u sqrt(1 - u^2) + asin u) / 2. The cost follows the
+ * length of the boundary in pixels, not the area of the shape. A path may wind
+ * any number of times and cross itself, so each row of it is settled under its
+ * fill rule first (see path_settle).
+ *
+ * With hard edges a pixel is in when its centre is: for the line through a
+ * row's centres the shape says where the line is inside it, as intervals of x.
  */
 #include "core.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -125,11 +141,13 @@ static void run(const paint_surface *s, const paint_paint *paint, int row, int x
 
 	/* A gradient: each pixel centre taken to gradient space, where t picks the colour off the ramp. */
 	const double *m = paint->m;
-	double px = x + 0.5, py = row + 0.5;
-	double u = m[0] * px + m[2] * py + m[4];
-	double v = m[1] * px + m[3] * py + m[5];
+	const double py = row + 0.5;
 
-	for (int i = 0; i < length; i++, p += 4, u += m[0], v += m[1]) {
+	/* each pixel's place worked out on its own, so where a span is split does not move a bit */
+	for (int i = 0; i < length; i++, p += 4) {
+		const double px = (double) (x + i) + 0.5;
+		const double u = m[0] * px + m[2] * py + m[4];
+		const double v = m[1] * px + m[3] * py + m[5];
 		double t = paint->kind == PAINT_RADIAL ? hypot(u, v) : u;
 
 		if (paint->spread == PAINT_PAD) {
@@ -165,9 +183,9 @@ void paint_clear(const paint_surface *s, uint32_t rgba, paint_clip rect)
 	}
 }
 
-/* ---- the scan ---- */
+/* ---- hard edges: the line through each row's centres ---- */
 
-/* Where sample line y is inside the shape: *out is count pairs [from, to), in increasing x. Lines are asked in increasing y. */
+/* Where line y is inside the shape: *out is count pairs [from, to), in increasing x. Lines are asked in increasing y. */
 typedef int (*across_fn)(void *shape, double y, const double **out);
 
 static double clampd(double v, double low, double high)
@@ -175,8 +193,8 @@ static double clampd(double v, double low, double high)
 	return v < low ? low : (v > high ? high : v);
 }
 
-/* The rows and columns of the shape's extent, a pixel more each side, cut to the clip. */
-static int scan(const paint_surface *s, paint_clip clip, double x0, double y0, double x1, double y1, across_fn across, void *shape, int antialias, const paint_paint *paint, paint_box *box)
+/* The rows of the shape's extent, a pixel more each side, cut to the clip: a pixel is in when its centre is. */
+static int scan(const paint_surface *s, paint_clip clip, double x0, double y0, double x1, double y1, across_fn across, void *shape, const paint_paint *paint, paint_box *box)
 {
 	int left = (int) clampd(floor(x0) - 1, clip.x0, clip.x1);
 	int right = (int) clampd(ceil(x1) + 1, clip.x0, clip.x1);
@@ -188,122 +206,385 @@ static int scan(const paint_surface *s, paint_clip clip, double x0, double y0, d
 		return 0;
 	}
 
-	if (! antialias) {
-		for (int row = top; row < bottom; row++) {
-			int start = -1, end = -1;
-			int n = across(shape, row + 0.5, &spans);
+	for (int row = top; row < bottom; row++) {
+		int start = -1, end = -1;
+		int n = across(shape, row + 0.5, &spans);
 
-			for (int i = 0; i < n; i++) {
-				int first = (int) clampd(ceil(spans[2 * i] - 0.5), left, right);
-				int stop = (int) clampd(ceil(spans[2 * i + 1] - 0.5), left, right);
+		for (int i = 0; i < n; i++) {
+			int first = (int) clampd(ceil(spans[2 * i] - 0.5), left, right);
+			int stop = (int) clampd(ceil(spans[2 * i + 1] - 0.5), left, right);
 
-				if (stop <= first) {
-					continue;
-				}
-				if (first == end) {
-					end = stop;
-					continue;
-				}
-				if (end > start) {
-					run(s, paint, row, start, end - start, 255, box);
-				}
-				start = first;
+			if (stop <= first) {
+				continue;
+			}
+			if (first == end) {
 				end = stop;
+				continue;
 			}
 			if (end > start) {
 				run(s, paint, row, start, end - start, 255, box);
 			}
+			start = first;
+			end = stop;
 		}
-
-		return 0;
+		if (end > start) {
+			run(s, paint, row, start, end - start, 255, box);
+		}
 	}
-
-	int width = right - left;
-	const double weight = 1.0 / PAINT_SAMPLES;
-	/* cover: what each pixel's own partial ends add. delta: where a run of whole pixels starts and stops. */
-	double *cover = calloc((size_t) width, sizeof(double));
-	double *delta = calloc((size_t) width + 1, sizeof(double));
-
-	if (cover == NULL || delta == NULL) {
-		free(cover);
-		free(delta);
-		return -1;
-	}
-
-	for (int row = top; row < bottom; row++) {
-		int low = width, high = -1;
-
-		for (int k = 0; k < PAINT_SAMPLES; k++) {
-			int n = across(shape, row + (k + 0.5) / PAINT_SAMPLES, &spans);
-
-			for (int i = 0; i < n; i++) {
-				double a = spans[2 * i], b = spans[2 * i + 1];
-
-				if (a < left) a = left;
-				if (b > right) b = right;
-				if (b <= a) {
-					continue;
-				}
-
-				int ia = (int) floor(a), ib = (int) floor(b);
-
-				if (ia == ib) {
-					cover[ia - left] += (b - a) * weight;
-				} else {
-					cover[ia - left] += ((ia + 1) - a) * weight;
-					if (ia + 1 < ib) {
-						delta[ia + 1 - left] += weight;
-						delta[ib - left] -= weight;
-					}
-					if (b > ib) {
-						cover[ib - left] += (b - ib) * weight;
-					}
-				}
-				if (ia - left < low) low = ia - left;
-				if (ib - left > high) high = ib - left;
-			}
-		}
-		if (high < 0) {
-			continue;
-		}
-
-		int last = high < width - 1 ? high : width - 1;
-		double running = 0.0;
-		int start = -1, value = 0;
-
-		int flat = 0;    /* the pixel before held no partial end: its coverage was running alone */
-
-		for (int i = low; i <= last; i++) {
-			int v;
-
-			if (flat && delta[i] == 0.0 && cover[i] == 0.0) {
-				v = value;    /* the same sum as the pixel before, so the same byte */
-			} else {
-				running += delta[i];
-				v = (int) floor(clampd(cover[i] + running, 0.0, 1.0) * 255 + 0.5);
-				flat = cover[i] == 0.0;
-			}
-
-			if (! (start >= 0 && v == value)) {
-				if (start >= 0 && value > 0) {
-					run(s, paint, row, left + start, i - start, value, box);
-				}
-				start = i;
-				value = v;
-			}
-		}
-		if (value > 0) {
-			run(s, paint, row, left + start, last + 1 - start, value, box);
-		}
-
-		memset(cover + low, 0, (size_t) (last - low + 1) * sizeof(double));
-		memset(delta + low, 0, (size_t) (high - low + 1) * sizeof(double));
-	}
-
-	free(cover);
-	free(delta);
 
 	return 0;
+}
+
+/* ---- anti-aliased: exact area ---- */
+
+/*
+ * One row's sums. What a piece adds left of the clip is left of every pixel in it, so it goes to the clip's
+ * first column; what it adds at or past the clip's right side is never read.
+ */
+typedef struct {
+	const paint_surface *s;
+	const paint_paint *paint;
+	paint_box *box;
+	int left, top, right, bottom;  /* the clip */
+	int base;                      /* gains[i] is column base + i */
+	double *gains;                 /* what the running sum gains at each column */
+	int low, high;                 /* the columns touched in this row; high < low when none */
+} area_sum;
+
+/* Room for the columns of x0..x1, a pixel more each side so rounding in a piece's x stays inside, cut to the clip. */
+static int area_open(area_sum *a, const paint_surface *s, paint_clip clip, double x0, double x1, const paint_paint *paint, paint_box *box)
+{
+	int base = (int) clampd(floor(x0) - 1, clip.x0, clip.x1);
+	int end = (int) clampd(floor(x1) + 2, clip.x0, clip.x1);
+
+	a->s = s;
+	a->paint = paint;
+	a->box = box;
+	a->left = clip.x0;
+	a->top = clip.y0;
+	a->right = clip.x1;
+	a->bottom = clip.y1;
+	a->base = base;
+	a->low = INT_MAX;
+	a->high = INT_MIN;
+	a->gains = calloc((size_t) (end - base + 1), sizeof(double));
+
+	return a->gains == NULL ? -1 : 0;
+}
+
+static inline void gain(area_sum *a, int column, double v)
+{
+	a->gains[column - a->base] += v;
+	if (column < a->low) {
+		a->low = column;
+	}
+	if (column > a->high) {
+		a->high = column;
+	}
+}
+
+/* The row's coverage, the size of its running sum held to 1, painted as runs; then the sums are cleared. */
+static void area_row(area_sum *a, int row)
+{
+	if (a->high < a->low) {
+		return;
+	}
+
+	int last = a->high < a->right - 1 ? a->high : a->right - 1;
+	double sum = 0.0;
+	int start = 0, value = 0;
+
+	for (int column = a->low; column <= last; column++) {
+		sum += a->gains[column - a->base];
+
+		double c = sum < 0.0 ? -sum : sum;
+
+		if (c > 1.0) {
+			c = 1.0;
+		}
+
+		int v = (int) (c * 255.0 + 0.5);
+
+		if (v != value) {
+			if (value > 0 && column > start) {
+				run(a->s, a->paint, row, start, column - start, value, a->box);
+			}
+			start = column;
+			value = v;
+		}
+	}
+	if (value > 0 && a->right > start) {
+		run(a->s, a->paint, row, start, a->right - start, value, a->box);
+	}
+	memset(a->gains + (a->low - a->base), 0, (size_t) (a->high - a->low + 1) * sizeof(double));
+	a->low = INT_MAX;
+	a->high = INT_MIN;
+}
+
+/* A straight piece inside one row: h high, from x = xa at its top to x = xb at its bottom, adding winding w on its right. */
+static void area_span(area_sum *a, double xa, double xb, double h, double w)
+{
+	if (h <= 0.0) {
+		return;
+	}
+
+	int left = a->left, right = a->right;
+	double xl, xr;
+
+	if (xa <= xb) {
+		xl = xa;
+		xr = xb;
+	} else {
+		xl = xb;
+		xr = xa;
+	}
+	if (xl >= right) {
+		return;
+	}
+	if (xr <= left) {
+		gain(a, left, w * h);
+		return;
+	}
+
+	int il = (int) floor(xl), ir = (int) floor(xr);
+
+	if (il == ir) {
+		/* one pixel: the moment is the height times the mean distance from the pixel's left side */
+		double m = h * ((xa + xb) / 2 - il);
+
+		gain(a, il, w * (h - m));
+		gain(a, il + 1, w * m);
+		return;
+	}
+
+	/* several pixels: walked by x, each taking the height the piece spends in it */
+	double rise = h / (xr - xl);
+	int i = il;
+
+	if (il < left) {
+		gain(a, left, w * (left - xl) * rise);
+		i = left;
+	}
+
+	int stop = ir < right - 1 ? ir : right - 1;
+
+	for (; i <= stop; i++) {
+		double xs = xl > i ? xl : (double) i;
+		double xe = xr < i + 1 ? xr : (double) (i + 1);
+		double hi = (xe - xs) * rise;
+		double m = hi * ((xs + xe) / 2 - i);
+
+		gain(a, i, w * (hi - m));
+		gain(a, i + 1, w * m);
+	}
+}
+
+/* The part of an arc inside one row where x runs one way, from height ya down to yb. side: -1 the left side, 1 the right. */
+static void area_arc_piece(area_sum *a, double cx, double cy, double rx, double ry, double side, double w, double ya, double yb)
+{
+	double h = yb - ya;
+	double ua = (ya - cy) / ry, ub = (yb - cy) / ry;
+
+	ua = ua < -1.0 ? -1.0 : (ua > 1.0 ? 1.0 : ua);
+	ub = ub < -1.0 ? -1.0 : (ub > 1.0 ? 1.0 : ub);
+
+	double sa = sqrt(1.0 - ua * ua), sb = sqrt(1.0 - ub * ub);
+	double xa = cx + side * rx * sa, xb = cx + side * rx * sb;
+	int left = a->left, right = a->right;
+	double xl, xr;
+
+	if (xa <= xb) {
+		xl = xa;
+		xr = xb;
+	} else {
+		xl = xb;
+		xr = xa;
+	}
+	if (xl >= right) {
+		return;
+	}
+	if (xr <= left) {
+		gain(a, left, w * h);
+		return;
+	}
+
+	/* the area under the circle from the centre line to u: (u sqrt(1 - u^2) + asin u) / 2 */
+	double pa = 0.5 * (ua * sa + asin(ua)), pb = 0.5 * (ub * sb + asin(ub));
+	double area = side * rx * ry;
+	int il = (int) floor(xl), ir = (int) floor(xr);
+
+	if (il == ir) {
+		double m = (cx - il) * h + area * (pb - pa);
+
+		gain(a, il, w * (h - m));
+		gain(a, il + 1, w * m);
+		return;
+	}
+
+	/* several pixels: cut where the arc crosses a pixel's side, the height of each crossing solved from x */
+	double half = (ya + yb) / 2 < cy ? -1.0 : 1.0;
+	double y1, p1, y_end, p_end;
+
+	/* the end at the smaller x first */
+	if (xa <= xb) {
+		y1 = ya;
+		p1 = pa;
+		y_end = yb;
+		p_end = pb;
+	} else {
+		y1 = yb;
+		p1 = pb;
+		y_end = ya;
+		p_end = pa;
+	}
+
+	int i = il;
+	int first = il + 1 > left ? il + 1 : left;
+	int stop = ir < right ? ir : right;
+
+	for (int k = first; k <= stop + 1; k++) {
+		double y2, p2;
+
+		if (k <= stop) {
+			double t = (k - cx) / rx;
+			double q = 1.0 - t * t;
+			double u = half * (q > 0.0 ? sqrt(q) : 0.0);
+
+			y2 = cy + ry * u;
+			p2 = 0.5 * (u * fabs(t) + asin(u));
+		} else {
+			y2 = y_end;
+			p2 = p_end;
+		}
+
+		double hi = fabs(y2 - y1);
+
+		if (i < left) {
+			gain(a, left, w * hi);
+		} else if (i < right) {
+			double m = (cx - i) * hi + area * (y2 > y1 ? p2 - p1 : p1 - p2);
+
+			gain(a, i, w * (hi - m));
+			gain(a, i + 1, w * m);
+		}
+		y1 = y2;
+		p1 = p2;
+		i = k;
+	}
+}
+
+/* A piece of a shape's boundary: a straight edge or one side of an ellipse, between two heights, cut to the clip. */
+typedef struct {
+	int arc, on;
+	double cx, cy, rx, ry, side;   /* an arc */
+	double x0, y0, slope;          /* an edge: x at y0, its top */
+	double w, from, to;
+	double reach_left, reach_right; /* the columns it can touch lie between these */
+} area_piece;
+
+/* One side of an ellipse between heights y_from and y_to, adding winding w on its right. */
+static area_piece area_arc(paint_clip clip, double cx, double cy, double rx, double ry, double side, double w, double y_from, double y_to)
+{
+	area_piece p = {.arc = 1, .cx = cx, .cy = cy, .rx = rx, .ry = ry, .side = side, .w = w, .reach_left = cx - rx, .reach_right = cx + rx};
+
+	if (rx <= 0.0 || ry <= 0.0) {
+		return p;
+	}
+
+	double from = y_from > cy - ry ? y_from : cy - ry;
+	double to = y_to < cy + ry ? y_to : cy + ry;
+
+	p.from = from > (double) clip.y0 ? from : (double) clip.y0;
+	p.to = to < (double) clip.y1 ? to : (double) clip.y1;
+	p.on = p.from < p.to;
+
+	return p;
+}
+
+/* A straight edge from (x0, y0) to (x1, y1): going down it adds 1 to the winding on its right, going up it takes 1 away. */
+static area_piece area_edge(paint_clip clip, double x0, double y0, double x1, double y1)
+{
+	area_piece p = {.arc = 0, .w = 1.0, .reach_left = x0 < x1 ? x0 : x1, .reach_right = x0 < x1 ? x1 : x0};
+
+	if (y0 == y1) {
+		return p;
+	}
+	if (y0 > y1) {
+		double t = x0;
+
+		x0 = x1;
+		x1 = t;
+		t = y0;
+		y0 = y1;
+		y1 = t;
+		p.w = -1.0;
+	}
+	p.x0 = x0;
+	p.y0 = y0;
+	p.slope = (x1 - x0) / (y1 - y0);
+	p.from = y0 > (double) clip.y0 ? y0 : (double) clip.y0;
+	p.to = y1 < (double) clip.y1 ? y1 : (double) clip.y1;
+	p.on = p.from < p.to;
+
+	return p;
+}
+
+/* What the piece adds in one row. */
+static void area_piece_row(area_sum *a, const area_piece *p, int row)
+{
+	if (! p->on) {
+		return;
+	}
+
+	double ya = p->from > (double) row ? p->from : (double) row;
+	double yb = p->to < (double) (row + 1) ? p->to : (double) (row + 1);
+
+	if (! p->arc) {
+		area_span(a, p->x0 + (ya - p->y0) * p->slope, p->x0 + (yb - p->y0) * p->slope, yb - ya, p->w);
+		return;
+	}
+	if (yb <= ya) {
+		return;
+	}
+	/* x runs one way above the centre and the other way below it */
+	if (ya < p->cy && p->cy < yb) {
+		area_arc_piece(a, p->cx, p->cy, p->rx, p->ry, p->side, p->w, ya, p->cy);
+		area_arc_piece(a, p->cx, p->cy, p->rx, p->ry, p->side, p->w, p->cy, yb);
+	} else {
+		area_arc_piece(a, p->cx, p->cy, p->rx, p->ry, p->side, p->w, ya, yb);
+	}
+}
+
+/* Sums with room for every column the pieces that are on can touch. */
+static int area_open_for(area_sum *a, const paint_surface *s, paint_clip clip, const area_piece *pieces, int count, const paint_paint *paint, paint_box *box)
+{
+	double left = INFINITY, right = -INFINITY;
+
+	for (int i = 0; i < count; i++) {
+		if (pieces[i].on) {
+			if (pieces[i].reach_left < left) left = pieces[i].reach_left;
+			if (pieces[i].reach_right > right) right = pieces[i].reach_right;
+		}
+	}
+	if (! (left <= right)) {
+		left = right = clip.x0;
+	}
+
+	return area_open(a, s, clip, left, right, paint, box);
+}
+
+/* The pieces, row by row over y0..y1 and a pixel more each side, each row's pieces in the order given, then painted. */
+static void area_pieces(area_sum *a, const area_piece *pieces, int count, double y0, double y1)
+{
+	int top = (int) clampd(floor(y0) - 1, a->top, a->bottom);
+	int bottom = (int) clampd(ceil(y1) + 1, a->top, a->bottom);
+
+	for (int row = top; row < bottom; row++) {
+		for (int i = 0; i < count; i++) {
+			area_piece_row(a, &pieces[i], row);
+		}
+		area_row(a, row);
+	}
 }
 
 /* ---- path ---- */
@@ -398,6 +679,294 @@ static int path_across(void *shape, double y, const double **out)
 	return n;
 }
 
+/*
+ * Anti-aliased, a path is settled one row at a time. The row is cut at the heights where an edge starts or ends
+ * inside it; between two cuts, the edges that span the stretch are sorted across and the winding counted from the
+ * left, and only the edges where inside turns to outside or back are integrated, as +1 and -1. Where two of them
+ * cross inside the stretch, it is cut at the crossings first, so between two cuts no edge crosses another and the
+ * area is exact for both fill rules.
+ */
+
+typedef struct {
+	double ymin, ymax, x, slope;    /* x at ymin, its top */
+	int w, order;                   /* 1 going down, -1 going up; its place in the path */
+} band_edge;
+
+typedef struct {
+	double xa, xb, key;             /* x at the stretch's top and bottom; their sum, what they are sorted by */
+	int w, place;
+} band_cross;
+
+typedef struct {
+	area_sum *a;
+	band_edge *edges;
+	int *active, actives;
+	band_cross *across[2];          /* one for a stretch, one for the pieces it is cut into */
+	double *crossings;
+	size_t room;
+	int even_odd, failed;
+} band_path;
+
+static int band_by_top(const void *a, const void *b)
+{
+	const band_edge *e = a, *f = b;
+
+	if (e->ymin != f->ymin) {
+		return e->ymin < f->ymin ? -1 : 1;
+	}
+
+	return e->order - f->order;
+}
+
+static int band_by_key(const void *a, const void *b)
+{
+	const band_cross *c = a, *d = b;
+
+	if (c->key != d->key) {
+		return c->key < d->key ? -1 : 1;
+	}
+
+	return c->place - d->place;
+}
+
+static int by_value(const void *a, const void *b)
+{
+	double x = *(const double *) a, y = *(const double *) b;
+
+	return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+/* The edges between heights from and to of one row, none starting or ending between. */
+static void path_settle(band_path *p, double from, double to, int may_cross, int depth)
+{
+	band_cross *across = p->across[depth];
+	int n = 0;
+
+	for (int i = 0; i < p->actives; i++) {
+		const band_edge *e = &p->edges[p->active[i]];
+
+		if (e->ymin <= from && e->ymax >= to) {
+			across[n].xa = e->x + (from - e->ymin) * e->slope;
+			across[n].xb = e->x + (to - e->ymin) * e->slope;
+			across[n].key = across[n].xa + across[n].xb;
+			across[n].w = e->w;
+			across[n].place = n;
+			n++;
+		}
+	}
+	if (n == 0) {
+		return;
+	}
+	qsort(across, (size_t) n, sizeof(band_cross), band_by_key);
+
+	int i = 1;
+
+	for (; may_cross && i < n; i++) {
+		if (across[i].xa < across[i - 1].xa || across[i].xb < across[i - 1].xb) {
+			break;
+		}
+	}
+	if (may_cross && i < n) {
+		/* two edges cross inside the stretch when one is left of the other at one end and right of it at the other */
+		size_t found = 0;
+
+		for (int j = 0; j < n; j++) {
+			for (int k = j + 1; k < n; k++) {
+				double top = across[k].xa - across[j].xa;
+				double bottom = across[k].xb - across[j].xb;
+
+				if ((top > 0.0 && bottom < 0.0) || (top < 0.0 && bottom > 0.0)) {
+					if (found + 1 >= p->room) {
+						size_t room = p->room ? p->room * 2 : 64;
+						double *grown = realloc(p->crossings, room * sizeof(double));
+
+						if (grown == NULL) {
+							p->failed = 1;
+							return;
+						}
+						p->crossings = grown;
+						p->room = room;
+					}
+					p->crossings[found++] = from + (to - from) * top / (top - bottom);
+				}
+			}
+		}
+		if (found > 0) {
+			qsort(p->crossings, found, sizeof(double), by_value);
+			p->crossings[found++] = to;
+
+			double start = from;
+
+			for (size_t c = 0; c < found; c++) {
+				if (p->crossings[c] > start) {
+					path_settle(p, start, p->crossings[c], 0, 1);
+					start = p->crossings[c];
+				}
+			}
+
+			return;
+		}
+	}
+
+	double h = to - from;
+	int winding = 0, inside = 0;
+
+	for (int c = 0; c < n; c++) {
+		winding += across[c].w;
+
+		int now = p->even_odd ? (winding & 1) == 1 : winding != 0;
+
+		if (now != inside) {
+			area_span(p->a, across[c].xa, across[c].xb, h, now ? 1.0 : -1.0);
+			inside = now;
+		}
+	}
+}
+
+static int path_area(const paint_surface *s, paint_clip clip, const double *const *contours, const int *points, int count, size_t total, int rule, const paint_paint *paint, paint_box *box)
+{
+	area_sum a = {0};
+	band_path p = {0};
+	double *cuts = NULL;
+	double left = INFINITY, right = -INFINITY;
+	int edges = 0, result = -1;
+
+	p.edges = malloc(total * sizeof(band_edge));
+	p.active = malloc(total * sizeof(int));
+	p.across[0] = malloc(total * sizeof(band_cross));
+	p.across[1] = malloc(total * sizeof(band_cross));
+	cuts = malloc((total * 2 + 1) * sizeof(double));
+	if (p.edges == NULL || p.active == NULL || p.across[0] == NULL || p.across[1] == NULL || cuts == NULL) {
+		goto done;
+	}
+
+	for (int c = 0; c < count; c++) {
+		const double *f = contours[c];
+		int n = points[c];
+
+		for (int i = 0; i < n; i++) {
+			int j = i + 1 == n ? 0 : i + 1;
+			double x0 = f[2 * i], y0 = f[2 * i + 1], x1 = f[2 * j], y1 = f[2 * j + 1];
+
+			if (x0 < left) left = x0;
+			if (x0 > right) right = x0;
+			if (y0 == y1) {
+				continue;
+			}
+
+			band_edge e = y0 < y1
+				? (band_edge) {y0, y1, x0, (x1 - x0) / (y1 - y0), 1, 0}
+				: (band_edge) {y1, y0, x1, (x0 - x1) / (y0 - y1), -1, 0};
+
+			if (e.ymax > clip.y0 && e.ymin < clip.y1) {
+				e.order = edges;
+				p.edges[edges++] = e;
+			}
+		}
+	}
+	if (edges == 0) {
+		result = 0;
+		goto done;
+	}
+	qsort(p.edges, (size_t) edges, sizeof(band_edge), band_by_top);
+	if (area_open(&a, s, clip, left, right, paint, box) != 0) {
+		goto done;
+	}
+	p.a = &a;
+	p.even_odd = rule == PAINT_EVEN_ODD;
+
+	int next = 0;
+	int lowest = (int) floor(p.edges[0].ymin);
+
+	for (int row = lowest > clip.y0 ? lowest : clip.y0; row < clip.y1; row++) {
+		double lo = (double) row, hi = (double) (row + 1);
+		int cut = 0, ended = 0;
+
+		while (next < edges && p.edges[next].ymin < hi) {
+			p.active[p.actives++] = next++;
+		}
+		/* the heights inside the row where an edge starts or ends; an edge that ended above it leaves the list */
+		for (int i = 0; i < p.actives; i++) {
+			const band_edge *e = &p.edges[p.active[i]];
+
+			if (e->ymax <= lo) {
+				ended = 1;
+				continue;
+			}
+			if (e->ymin > lo) {
+				cuts[cut++] = e->ymin;
+			}
+			if (e->ymax < hi) {
+				cuts[cut++] = e->ymax;
+			}
+		}
+		if (ended) {
+			int kept = 0;
+
+			for (int i = 0; i < p.actives; i++) {
+				if (p.edges[p.active[i]].ymax > lo) {
+					p.active[kept++] = p.active[i];
+				}
+			}
+			p.actives = kept;
+		}
+		if (p.actives == 0) {
+			if (next >= edges) {
+				break;
+			}
+			continue;
+		}
+
+		if (cut == 0 && p.actives == 2) {
+			const band_edge *e = &p.edges[p.active[0]], *f = &p.edges[p.active[1]];
+
+			if (e->w != f->w) {
+				/*
+				 * two edges the whole row high, one each way, that do not cross in it: between them the winding
+				 * is 1 or -1 whichever is left, and the row takes the size of its sum
+				 */
+				double at = e->x + (lo - e->ymin) * e->slope, ab = e->x + (hi - e->ymin) * e->slope;
+				double bt = f->x + (lo - f->ymin) * f->slope, bb = f->x + (hi - f->ymin) * f->slope;
+
+				if ((at - bt) * (ab - bb) >= 0.0) {
+					area_span(&a, at, ab, 1.0, (double) e->w);
+					area_span(&a, bt, bb, 1.0, (double) f->w);
+					area_row(&a, row);
+					continue;
+				}
+			}
+		}
+
+		qsort(cuts, (size_t) cut, sizeof(double), by_value);
+		cuts[cut++] = hi;
+
+		double from = lo;
+
+		for (int i = 0; i < cut; i++) {
+			if (cuts[i] > from) {
+				path_settle(&p, from, cuts[i], 1, 0);
+				if (p.failed) {
+					goto done;
+				}
+				from = cuts[i];
+			}
+		}
+		area_row(&a, row);
+	}
+	result = 0;
+
+done:
+	free(a.gains);
+	free(p.edges);
+	free(p.active);
+	free(p.across[0]);
+	free(p.across[1]);
+	free(p.crossings);
+	free(cuts);
+
+	return result;
+}
+
 int paint_path(const paint_surface *s, paint_clip clip, const double *const *contours, const int *points, int count, int rule, int antialias, const paint_paint *paint, paint_box *box)
 {
 	path_shape p = {0};
@@ -410,6 +979,9 @@ int paint_path(const paint_surface *s, paint_clip clip, const double *const *con
 	}
 	if (total == 0) {
 		return 0;
+	}
+	if (antialias) {
+		return path_area(s, clip, contours, points, count, total, rule, paint, box);
 	}
 
 	p.edges = malloc(total * sizeof(path_edge));
@@ -454,7 +1026,7 @@ int paint_path(const paint_surface *s, paint_clip clip, const double *const *con
 	qsort(p.edges, (size_t) p.count, sizeof(path_edge), by_top);
 	p.even_odd = rule == PAINT_EVEN_ODD;
 
-	result = scan(s, clip, left, top, right, bottom, path_across, &p, antialias, paint, box);
+	result = scan(s, clip, left, top, right, bottom, path_across, &p, paint, box);
 
 done:
 	free(p.edges);
@@ -518,6 +1090,33 @@ static int ring_across(void *shape, double y, const double **out)
 	return 2;
 }
 
+/*
+ * Anti-aliased: the ellipse half a stroke larger, its left side winding what is right of it in and its right side
+ * winding it out again; less, where there is one, the ellipse half the stroke smaller, wound the other way.
+ */
+static int ellipse_area(const paint_surface *s, paint_clip clip, double cx, double cy, double rx, double ry, double half, const paint_paint *paint, paint_box *box)
+{
+	area_sum a;
+	area_piece pieces[4];
+	int count = 2;
+	double outer_x = rx + half, outer_y = ry + half;
+
+	pieces[0] = area_arc(clip, cx, cy, outer_x, outer_y, -1.0, 1.0, cy - ry - half, cy + ry + half);
+	pieces[1] = area_arc(clip, cx, cy, outer_x, outer_y, 1.0, -1.0, cy - ry - half, cy + ry + half);
+	if (half > 0 && rx - half > 0 && ry - half > 0) {
+		pieces[2] = area_arc(clip, cx, cy, rx - half, ry - half, -1.0, -1.0, cy - ry + half, cy + ry - half);
+		pieces[3] = area_arc(clip, cx, cy, rx - half, ry - half, 1.0, 1.0, cy - ry + half, cy + ry - half);
+		count = 4;
+	}
+	if (area_open_for(&a, s, clip, pieces, count, paint, box) != 0) {
+		return -1;
+	}
+	area_pieces(&a, pieces, count, cy - outer_y, cy + outer_y);
+	free(a.gains);
+
+	return 0;
+}
+
 int paint_ellipse(const paint_surface *s, paint_clip clip, double cx, double cy, double rx, double ry, int antialias, const paint_paint *paint, paint_box *box)
 {
 	round_shape e = {cx, cy, rx, ry, 0.0, {0}};
@@ -525,8 +1124,11 @@ int paint_ellipse(const paint_surface *s, paint_clip clip, double cx, double cy,
 	if (rx <= 0 || ry <= 0) {
 		return 0;
 	}
+	if (antialias) {
+		return ellipse_area(s, clip, cx, cy, rx, ry, 0.0, paint, box);
+	}
 
-	return scan(s, clip, cx - rx, cy - ry, cx + rx, cy + ry, ellipse_across, &e, antialias, paint, box);
+	return scan(s, clip, cx - rx, cy - ry, cx + rx, cy + ry, ellipse_across, &e, paint, box);
 }
 
 int paint_ring(const paint_surface *s, paint_clip clip, double cx, double cy, double rx, double ry, double stroke, int antialias, const paint_paint *paint, paint_box *box)
@@ -536,8 +1138,11 @@ int paint_ring(const paint_surface *s, paint_clip clip, double cx, double cy, do
 	if (rx <= 0 || ry <= 0 || stroke <= 0) {
 		return 0;
 	}
+	if (antialias) {
+		return ellipse_area(s, clip, cx, cy, rx, ry, e.half, paint, box);
+	}
 
-	return scan(s, clip, cx - (rx + e.half), cy - (ry + e.half), cx + (rx + e.half), cy + (ry + e.half), ring_across, &e, antialias, paint, box);
+	return scan(s, clip, cx - (rx + e.half), cy - (ry + e.half), cx + (rx + e.half), cy + (ry + e.half), ring_across, &e, paint, box);
 }
 
 /* ---- rounded box and its ring ---- */
@@ -611,6 +1216,56 @@ static int box_across(void *shape, double y, const double **out)
 	return 2;
 }
 
+/*
+ * Anti-aliased: the two sides of a rounded box, winding w inside it. Down a side: the quarter circle of the top
+ * corner, the straight part, the quarter circle of the bottom corner. r is tl, tr, br, bl. Adds up to six pieces.
+ */
+static int box_sides(paint_clip clip, area_piece *pieces, double x0, double y0, double x1, double y1, const double *r, double w)
+{
+	const double sides[2][5] = {{x0, r[0], r[3], -1.0, w}, {x1, r[1], r[2], 1.0, -w}};
+	int count = 0;
+
+	for (int i = 0; i < 2; i++) {
+		double x = sides[i][0], top = sides[i][1], bottom = sides[i][2], side = sides[i][3], winding = sides[i][4];
+		/* where the top corner ends and the bottom one starts */
+		double upper = y0 + top < y1 ? y0 + top : y1;
+		double lower = y1 - bottom > upper ? y1 - bottom : upper;
+
+		if (top > 0) {
+			pieces[count++] = area_arc(clip, x - side * top, y0 + top, top, top, side, winding, y0, upper);
+		}
+		if (lower > upper) {
+			/* a straight edge winds 1 going down and -1 going up */
+			pieces[count++] = winding > 0 ? area_edge(clip, x, upper, x, lower) : area_edge(clip, x, lower, x, upper);
+		}
+		if (bottom > 0 && y1 > lower) {
+			pieces[count++] = area_arc(clip, x - side * bottom, y1 - bottom, bottom, bottom, side, winding, lower, y1);
+		}
+	}
+
+	return count;
+}
+
+/* The box, less the inner one wound the other way when there is one. */
+static int box_area(const paint_surface *s, paint_clip clip, const box_shape *b, const paint_paint *paint, paint_box *box)
+{
+	area_sum a;
+	area_piece pieces[12];
+	int count;
+
+	count = box_sides(clip, pieces, b->x0, b->y0, b->x1, b->y1, b->r, 1.0);
+	if (b->hollow) {
+		count += box_sides(clip, pieces + count, b->ix0, b->iy0, b->ix1, b->iy1, b->ir, -1.0);
+	}
+	if (area_open_for(&a, s, clip, pieces, count, paint, box) != 0) {
+		return -1;
+	}
+	area_pieces(&a, pieces, count, b->y0, b->y1);
+	free(a.gains);
+
+	return 0;
+}
+
 int paint_round_rect(const paint_surface *s, paint_clip clip, double x0, double y0, double x1, double y1, const double r[4], int antialias, const paint_paint *paint, paint_box *box)
 {
 	box_shape b = {.x0 = x0, .y0 = y0, .x1 = x1, .y1 = y1, .r = {r[0], r[1], r[2], r[3]}};
@@ -618,8 +1273,11 @@ int paint_round_rect(const paint_surface *s, paint_clip clip, double x0, double 
 	if (x1 <= x0 || y1 <= y0) {
 		return 0;
 	}
+	if (antialias) {
+		return box_area(s, clip, &b, paint, box);
+	}
 
-	return scan(s, clip, x0, y0, x1, y1, box_across, &b, antialias, paint, box);
+	return scan(s, clip, x0, y0, x1, y1, box_across, &b, paint, box);
 }
 
 int paint_round_ring(const paint_surface *s, paint_clip clip, double x0, double y0, double x1, double y1, const double r[4], double inset, int antialias, const paint_paint *paint, paint_box *box)
@@ -638,8 +1296,11 @@ int paint_round_ring(const paint_surface *s, paint_clip clip, double x0, double 
 		b.ir[i] = r[i] - inset > 0.0 ? r[i] - inset : 0.0;
 	}
 	b.hollow = b.ix1 > b.ix0 && b.iy1 > b.iy0;
+	if (antialias) {
+		return box_area(s, clip, &b, paint, box);
+	}
 
-	return scan(s, clip, x0, y0, x1, y1, box_across, &b, antialias, paint, box);
+	return scan(s, clip, x0, y0, x1, y1, box_across, &b, paint, box);
 }
 
 /* ---- shadow ---- */
@@ -816,4 +1477,96 @@ int paint_polyline(const paint_surface *s, paint_clip clip, const double *points
 	free(px.pixels);
 
 	return result;
+}
+
+
+/* ----------------------------------------------------------------- gradients */
+
+void paint_ramp(const double *offsets, const uint32_t *colours, int count, uint8_t ramp[PAINT_RAMP_BYTES])
+{
+	int k = 0, last = count - 1;
+
+	for (int i = 0; i < 256; i++) {
+		double x = (double) i / 255.0;
+		uint8_t *out = ramp + 4 * i;
+
+		while (k < last && offsets[k + 1] <= x) {
+			k++;
+		}
+		if (x < offsets[0] || k == last) {
+			uint32_t c = x < offsets[0] ? colours[0] : colours[last];
+
+			out[0] = (uint8_t) (c >> 24);
+			out[1] = (uint8_t) (c >> 16);
+			out[2] = (uint8_t) (c >> 8);
+			out[3] = (uint8_t) c;
+			continue;
+		}
+		double u = (x - offsets[k]) / (offsets[k + 1] - offsets[k]);
+
+		for (int ch = 0; ch < 4; ch++) {
+			double a = (double) ((colours[k] >> (24 - 8 * ch)) & 0xFF);
+			double b = (double) ((colours[k + 1] >> (24 - 8 * ch)) & 0xFF);
+
+			out[ch] = (uint8_t) (int) floor(a + (b - a) * u + 0.5);
+		}
+	}
+}
+
+int paint_gradient_matrix(int kind, const double *geometry, const double forward[6], double m[6])
+{
+	const double a = forward[0], b = forward[1], c = forward[2], d = forward[3], e = forward[4], f = forward[5];
+	double det = a * d - b * c, inv[6], g[6];
+
+	if (det == 0.0 || !isfinite(det)) {
+		return 0;
+	}
+	/* the transform undone: x = inv0 X + inv2 Y + inv4, y = inv1 X + inv3 Y + inv5 */
+	inv[0] = d / det;
+	inv[1] = -b / det;
+	inv[2] = -c / det;
+	inv[3] = a / det;
+	inv[4] = (c * f - d * e) / det;
+	inv[5] = (b * e - a * f) / det;
+
+	if (kind == PAINT_LINEAR) {
+		/* u along the line from (x0, y0), 1 at (x1, y1); v across it, in the same units */
+		double dx = geometry[2] - geometry[0], dy = geometry[3] - geometry[1], l = dx * dx + dy * dy;
+
+		if (!(l > 0.0) || !isfinite(l)) {
+			return 0;
+		}
+		g[0] = dx / l;
+		g[1] = -dy / l;
+		g[2] = dy / l;
+		g[3] = dx / l;
+		g[4] = -(geometry[0] * dx + geometry[1] * dy) / l;
+		g[5] = (geometry[0] * dy - geometry[1] * dx) / l;
+	} else {
+		/* (u, v) from the centre, 1 at the radius */
+		double r = geometry[2];
+
+		if (!(r > 0.0) || !isfinite(r)) {
+			return 0;
+		}
+		g[0] = 1.0 / r;
+		g[1] = 0.0;
+		g[2] = 0.0;
+		g[3] = 1.0 / r;
+		g[4] = -geometry[0] / r;
+		g[5] = -geometry[1] / r;
+	}
+	/* the gradient's map after the transform undone */
+	m[0] = g[0] * inv[0] + g[2] * inv[1];
+	m[1] = g[1] * inv[0] + g[3] * inv[1];
+	m[2] = g[0] * inv[2] + g[2] * inv[3];
+	m[3] = g[1] * inv[2] + g[3] * inv[3];
+	m[4] = (g[0] * inv[4] + g[2] * inv[5]) + g[4];
+	m[5] = (g[1] * inv[4] + g[3] * inv[5]) + g[5];
+	for (int i = 0; i < 6; i++) {
+		if (!isfinite(m[i])) {
+			return 0;
+		}
+	}
+	return 1;
 }

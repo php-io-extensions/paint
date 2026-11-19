@@ -35,5 +35,5 @@ it('declares the constants and methods its stubs do', function (): void {
         ->and(PAINT_RAMP_BYTES)->toBe(1024)
         ->and(PAINT_LIMIT)->toBe(1073741824.0)
         ->and(array_map(fn (ReflectionMethod $m): string => $m->getName(), (new ReflectionClass(PaintSurface::class))->getMethods()))
-        ->toBe(['__construct', 'over', 'width', 'height', 'bytes', 'clear', 'fill']);
+        ->toBe(['__construct', 'over', 'gradient', 'width', 'height', 'bytes', 'clear', 'fill']);
 });

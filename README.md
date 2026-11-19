@@ -14,7 +14,7 @@
 
 </div>
 
-Drawing a filled shape means deciding, for every pixel near it, how much of that pixel the shape covers, and then mixing the shape's colour into the pixel by that amount. In PHP that is a loop over rows, a loop over sample lines inside each row, and a loop over pixels, with float arithmetic in the middle and four byte writes at the end.
+Drawing a filled shape means deciding, for every pixel near it, how much of that pixel the shape covers, and then mixing the shape's colour into the pixel by that amount. In PHP that is a loop over rows and a walk along each edge through the pixels it crosses, with float arithmetic in the middle and four byte writes at the end. ext-paint works the covered area out exactly, from the shape's edges and curves, instead of sampling it.
 
 <b>ext-paint</b> runs those loops in C. You hand it a list of shapes and their paints; it works out the coverage and blends them into 32-bit pixels, its own or memory you already hold. It has no dependency, no window, no fonts and no drawing state: shapes go in, pixels change, and the same input gives the same bytes on every platform.
 

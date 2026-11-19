@@ -11,7 +11,7 @@
  * its kind (PAINT_PATH and the others, each documented on its constant).
  *
  * With anti-aliasing a pixel is covered by the share of its area inside the
- * shape, measured on PAINT_SAMPLES (16) lines a row. Without, a pixel is in
+ * shape, worked out exactly, not sampled. Without, a pixel is in
  * when its centre is. A covered pixel takes the paint's colour by
  * alpha * coverage: channel = (colour * a + pixel * (255 - a) + 127) / 255,
  * and its alpha moves toward 255 the same way.
@@ -37,6 +37,21 @@ final class PaintSurface
      * @param int $stride At least $width * 4.
      */
     public static function over(int $address, int $width, int $height, int $stride, int $order, object $owner): PaintSurface {}
+
+    /**
+     * The gradient paint fill() takes, [kind, spread, ramp, a, b, c, d, e, f], from a gradient given in a shape's
+     * units and the transform the shape is drawn through. The ramp: for each of 256 steps x = i / 255 the last stop
+     * at or before x, each channel interpolated straight to the next stop and rounded half up. The six numbers: the
+     * transform undone, then the gradient's own map (linear: along the line from (x0, y0) over its squared length;
+     * radial: from the centre over the radius). Null when the transform or the geometry cannot be undone.
+     *
+     * @param int $kind PAINT_LINEAR or PAINT_RADIAL.
+     * @param int $spread PAINT_PAD, PAINT_REPEAT or PAINT_REFLECT.
+     * @param array $geometry [x0, y0, x1, y1] or [cx, cy, r].
+     * @param array $stops [[offset, 0xRRGGBBAA], ...]: offsets 0..1, not falling, at least one stop.
+     * @param array $matrix [a, b, c, d, e, f]: x' = a x + c y + e, y' = b x + d y + f.
+     */
+    public static function gradient(int $kind, int $spread, array $geometry, array $stops, array $matrix): ?array {}
 
     public function width(): int {}
 

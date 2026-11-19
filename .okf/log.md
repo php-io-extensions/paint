@@ -1,6 +1,15 @@
 # Log
 
+## 2026-11-18
+
+* Anti-aliased coverage is exact area, not 16 sample lines a row: a shape is its boundary (straight pieces and arcs, each with its winding), each piece adds height minus moment to the pixel it crosses and the moment to the next, and a row's running sum is the covered area. A path settles each row under its fill rule first (cut where edges start, end or cross; only the edges where inside changes are integrated). Hard edges are unchanged. `asin` joins the arithmetic contract; `PAINT_SAMPLES` is gone. Same arithmetic, same order as Lustrous PHP's `LustrousPHPCoverage`: 6000 random commands of every kind byte-identical between the two. Edge bytes change for every caller (a circle inscribed in a pixel is 200, π/4, where sampling gave 201). The workload of 1000 triangles + 1000 ellipses anti-aliased: 4.75 → 1.34 ms and 2.0 → 1.7 ms. Five hand-worked tests added (curve areas, straight areas, crossings, windings above 1); each fails with its part of the C broken. 49 passed on Homebrew PHP 8.4.27 NTS and ZTS (macOS arm64), NTS under guard malloc, no fault under AddressSanitizer over 20000 random ops; 48 passed + the `over()` test skipped (no ext-ffi) on Debian 13 aarch64 ZTS (fnk). One 3000-op scene answers the same bytes, crc32 `200f6c12`, on macOS arm64 NTS and ZTS and Linux aarch64. Not yet checked on x86_64 (gamingpc unreachable). [surface](api/surface.md)
+
 ## 2026-11-13
 
 * A translucent run blends two bytes a multiply (bytes 0 and 2 in one word's halves, 1 and 3 in another's), dividing each half by 255 as `(y + 1 + (y >> 8)) >> 8`; the scan does not work a pixel's byte again when its sum is the one before it. The bytes are unchanged: 46 passed on NTS and ZTS, NTS under guard malloc. [surface](api/surface.md)
 * Bundle created with ext-paint 0.11.0: [surface](api/surface.md) (`PaintSurface`, 22 constants), [build](runbooks/build.md). Seven shape ops (path, ellipse, ring, rounded box and ring, shadow, one-pixel polyline), colour and gradient paints, four byte orders, `over()` for memory another object holds. `PHP_PAINT_VERSION` 0.11.0, `branch-alias` `dev-main` is `0.11.x-dev`, on the Venusian 0.11 line. Built with `-Wall -Wextra` with no warning from `src/`, `fmadd` count 0, installed and 46 passed on Homebrew PHP 8.4.27 NTS and ZTS (macOS arm64), NTS also under guard malloc. Not yet built on Linux.
+
+## 2026-11-18 (gradients built here)
+
+* `PaintSurface::gradient()`: the gradient paint `fill()` takes, built from stops, geometry and a forward transform, by the steps in [surface](api/surface.md#building-a-gradient). A gradient's pixels are now each placed on their own instead of stepped along a span, so how a span is split cannot move a bit; before, a 512-pixel repeating gradient differed from the same pixels painted one at a time at pixel 282. 64 passed on Homebrew PHP 8.4.27 NTS and ZTS (macOS arm64); four deliberate breaks (span-stepped sampling, the ramp rounded down, the inverse's translation, the radial centre) each fail. Lustrous PHP gives the same bytes as Lustrous C over 4,500 random commands, half with gradients under turned, scaled and sheared transforms. Not yet checked on Linux.
+

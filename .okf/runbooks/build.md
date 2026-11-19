@@ -25,7 +25,7 @@ macOS (`install-macos.sh`): builds in a temp copy for php@8.4 and php@8.4-zts, a
 
 Linux (`install-debian-trixie.sh`): builds in place, installs `paint.so`, writes `30-paint.ini`, removes build output.[^debian] Not yet run for this extension.
 
-`config.m4` passes `-ffp-contract=off`; a build without it may fuse the multiply-adds of the scan (`x0 + (y - y0) * slope`, a gradient's `a * px + c * py + e`) and answer different bytes from a PHP implementation of the same arithmetic. Check with `objdump -d src/.libs/core.o | grep -c fmadd`: 0 on arm64.
+`config.m4` passes `-ffp-contract=off`; a build without it may fuse the multiply-adds of the coverage (`x0 + (y - y0) * slope`, a gradient's `a * px + c * py + e`) and answer different bytes from a PHP implementation of the same arithmetic. Check with `objdump -d src/.libs/core.o | grep -c fmadd`: 0 on arm64.
 
 To test a consumer without the ext, run with a `PHP_INI_SCAN_DIR` that omits `30-paint.ini`; `php -n` drops every other conf.d extension too.
 

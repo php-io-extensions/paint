@@ -498,6 +498,121 @@ static int phppaint_op(const paint_surface *s, paint_clip clip, zval *value, uin
 	return -2;
 }
 
+/* count finite numbers of a list into out; false when it is not that. */
+static bool phppaint_finite_list(zval *value, uint32_t count, double *out)
+{
+	zval *n;
+	uint32_t i = 0;
+
+	ZVAL_DEREF(value);
+	if (Z_TYPE_P(value) != IS_ARRAY || !zend_array_is_list(Z_ARRVAL_P(value)) || zend_hash_num_elements(Z_ARRVAL_P(value)) != count) {
+		return false;
+	}
+	ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(value), n) {
+		ZVAL_DEREF(n);
+		if (Z_TYPE_P(n) == IS_LONG) {
+			out[i] = (double) Z_LVAL_P(n);
+		} else if (Z_TYPE_P(n) == IS_DOUBLE && zend_finite(Z_DVAL_P(n))) {
+			out[i] = Z_DVAL_P(n);
+		} else {
+			return false;
+		}
+		i++;
+	} ZEND_HASH_FOREACH_END();
+	return true;
+}
+
+PHP_METHOD(PaintSurface, gradient)
+{
+	zend_long kind, spread;
+	zval *geometry, *stops, *matrix, *stop, list;
+	double g[4], forward[6], m[6], *offsets;
+	uint32_t *colours, count, i = 0;
+	zend_string *ramp;
+
+	ZEND_PARSE_PARAMETERS_START(5, 5)
+		Z_PARAM_LONG(kind)
+		Z_PARAM_LONG(spread)
+		Z_PARAM_ZVAL(geometry)
+		Z_PARAM_ZVAL(stops)
+		Z_PARAM_ZVAL(matrix)
+	ZEND_PARSE_PARAMETERS_END();
+
+	if (kind != PAINT_LINEAR && kind != PAINT_RADIAL) {
+		zend_argument_value_error(1, "must be PAINT_LINEAR or PAINT_RADIAL");
+		RETURN_THROWS();
+	}
+	if (spread < PAINT_PAD || spread > PAINT_REFLECT) {
+		zend_argument_value_error(2, "must be PAINT_PAD, PAINT_REPEAT or PAINT_REFLECT");
+		RETURN_THROWS();
+	}
+	if (!phppaint_finite_list(geometry, kind == PAINT_LINEAR ? 4 : 3, g)) {
+		zend_argument_value_error(3, kind == PAINT_LINEAR ? "must be [x0, y0, x1, y1], finite" : "must be [cx, cy, r], finite");
+		RETURN_THROWS();
+	}
+	ZVAL_DEREF(stops);
+	if (Z_TYPE_P(stops) != IS_ARRAY || !zend_array_is_list(Z_ARRVAL_P(stops)) || (count = zend_hash_num_elements(Z_ARRVAL_P(stops))) == 0) {
+		zend_argument_value_error(4, "must be a list of stops [offset, 0xRRGGBBAA], at least one");
+		RETURN_THROWS();
+	}
+	if (!phppaint_finite_list(matrix, 6, forward)) {
+		zend_argument_value_error(5, "must be [a, b, c, d, e, f], finite");
+		RETURN_THROWS();
+	}
+	offsets = safe_emalloc(count, sizeof(double), 0);
+	colours = safe_emalloc(count, sizeof(uint32_t), 0);
+	ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(stops), stop) {
+		zval *offset, *colour;
+
+		ZVAL_DEREF(stop);
+		if (Z_TYPE_P(stop) != IS_ARRAY || !zend_array_is_list(Z_ARRVAL_P(stop)) || zend_hash_num_elements(Z_ARRVAL_P(stop)) != 2
+			|| (offset = zend_hash_index_find(Z_ARRVAL_P(stop), 0)) == NULL || (colour = zend_hash_index_find(Z_ARRVAL_P(stop), 1)) == NULL) {
+			goto bad_stop;
+		}
+		ZVAL_DEREF(offset);
+		ZVAL_DEREF(colour);
+		if (Z_TYPE_P(offset) == IS_LONG) {
+			offsets[i] = (double) Z_LVAL_P(offset);
+		} else if (Z_TYPE_P(offset) == IS_DOUBLE) {
+			offsets[i] = Z_DVAL_P(offset);
+		} else {
+			goto bad_stop;
+		}
+		if (!(offsets[i] >= 0.0 && offsets[i] <= 1.0) || (i > 0 && offsets[i] < offsets[i - 1])
+			|| Z_TYPE_P(colour) != IS_LONG || Z_LVAL_P(colour) < 0 || Z_LVAL_P(colour) > 0xFFFFFFFFLL) {
+			goto bad_stop;
+		}
+		colours[i] = (uint32_t) Z_LVAL_P(colour);
+		i++;
+	} ZEND_HASH_FOREACH_END();
+
+	if (!paint_gradient_matrix((int) kind, g, forward, m)) {
+		efree(offsets);
+		efree(colours);
+		RETURN_NULL();
+	}
+	ramp = zend_string_alloc(PAINT_RAMP_BYTES, false);
+	paint_ramp(offsets, colours, (int) count, (uint8_t *) ZSTR_VAL(ramp));
+	ZSTR_VAL(ramp)[PAINT_RAMP_BYTES] = '\0';
+	efree(offsets);
+	efree(colours);
+
+	array_init_size(&list, 9);
+	add_next_index_long(&list, kind);
+	add_next_index_long(&list, spread);
+	add_next_index_str(&list, ramp);
+	for (int k = 0; k < 6; k++) {
+		add_next_index_double(&list, m[k]);
+	}
+	RETURN_COPY_VALUE(&list);
+
+bad_stop:
+	efree(offsets);
+	efree(colours);
+	zend_argument_value_error(4, "must be a list of stops [offset 0..1 not falling, 0xRRGGBBAA]");
+	RETURN_THROWS();
+}
+
 PHP_METHOD(PaintSurface, fill)
 {
 	HashTable *ops, *paints;

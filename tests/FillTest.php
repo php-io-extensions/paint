@@ -4,8 +4,8 @@ declare(strict_types=1);
 
 /*
  * Coverage worked by hand. Hard edges: a pixel is in when its centre is.
- * Anti-aliased: a pixel's coverage is the share of its area inside the shape,
- * as a byte: floor(share * 255 + 0.5).
+ * Anti-aliased: a pixel's coverage is the exact share of its area inside the
+ * shape, as a byte: floor(share * 255 + 0.5).
  */
 
 it('fills the pixels whose centres are inside, with hard edges', function (): void {
@@ -28,6 +28,43 @@ it('covers a pixel by the area of it inside the shape, anti-aliased', function (
     expect(pixel($surface, 0, 0))->toBe([191, 191, 191, 191])
         ->and(pixel($surface, 1, 0))->toBe([255, 255, 255, 255])
         ->and(pixel($surface, 2, 0))->toBe([128, 128, 128, 128]);
+});
+
+/** The coverage byte of each pixel of a w x h surface after one op in opaque white: over a blank pixel, alpha = coverage. */
+function coverage(array $op, int $width, int $height): array
+{
+    $surface = new PaintSurface($width, $height);
+    $surface->fill([$op], [0xFFFFFFFF], 0, 0, $width, $height);
+
+    return array_map(fn (int $i): int => ord($surface->bytes()[$i * 4 + 3]), range(0, $width * $height - 1));
+}
+
+it('covers a pixel by the exact area of a curve, not a sampled one', function (): void {
+    // a circle inscribed in one pixel covers pi / 4 of it: floor(0.785398 * 255 + 0.5) = 200
+    expect(coverage([PAINT_ELLIPSE, 0.5, 0.5, 0.5, 0.5], 1, 1))->toBe([200])
+        // each pixel holds a quarter of the band between radii 0.5 and 1: pi * (1 - 0.25) / 4 = 0.589, so 150
+        ->and(coverage([PAINT_RING, 1, 1, 0.75, 0.75, 0.5], 2, 2))->toBe([150, 150, 150, 150])
+        // each pixel is one corner's quarter circle of radius 1: pi / 4, so 200
+        ->and(coverage([PAINT_ROUND_RECT, 0, 0, 2, 2, [1, 1, 1, 1]], 2, 2))->toBe([200, 200, 200, 200]);
+});
+
+it('covers a pixel by the exact area of straight edges, crossings settled by the rule', function (): void {
+    // the pixel's diagonal: half of it, floor(0.5 * 255 + 0.5) = 128
+    expect(coverage([PAINT_PATH, [[0, 0, 1, 0, 0, 1]], PAINT_NON_ZERO], 1, 1))->toBe([128])
+        // a bow-tie inside one pixel: two triangles of 1/4, wound opposite ways, so summed signed area would be 0;
+        // either rule fills both, 1/2
+        ->and(coverage([PAINT_PATH, [[0, 0, 1, 1, 1, 0, 0, 1]], PAINT_NON_ZERO], 1, 1))->toBe([128])
+        ->and(coverage([PAINT_PATH, [[0, 0, 1, 1, 1, 0, 0, 1]], PAINT_EVEN_ODD], 1, 1))->toBe([128])
+        // a square from far left of the rect to x = 0.5: what is left of the rect is left of its first pixel
+        ->and(coverage([PAINT_PATH, [[-5, 0, 0.5, 0, 0.5, 1, -5, 1]], PAINT_NON_ZERO], 2, 1))->toBe([128, 0]);
+});
+
+it('settles windings above 1 by the rule, anti-aliased', function (): void {
+    // x 0..6 and 2..4 over one row, wound the same way: winding 1, 2, 1, then 0 from x = 6 on
+    $nested = fn (int $rule): array => [PAINT_PATH, [[0, 0, 6, 0, 6, 1, 0, 1], [2, 0, 4, 0, 4, 1, 2, 1]], $rule];
+
+    expect(coverage($nested(PAINT_NON_ZERO), 8, 1))->toBe([255, 255, 255, 255, 255, 255, 0, 0])
+        ->and(coverage($nested(PAINT_EVEN_ODD), 8, 1))->toBe([255, 255, 0, 0, 255, 255, 0, 0]);
 });
 
 it('blends by the colour\'s alpha times the coverage', function (): void {

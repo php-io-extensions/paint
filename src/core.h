@@ -1,8 +1,9 @@
 /*
  * The painting itself, in plain C: no Zend types here. A surface is 32-bit
  * pixels, four bytes each in one of four orders, colours straight (not
- * premultiplied), top row first. A shape becomes coverage, sample line by
- * sample line, and the coverage is blended in at a colour or a gradient.
+ * premultiplied), top row first. A shape becomes coverage, the exact area of
+ * each pixel inside it (or, with hard edges, whether its centre is), and the
+ * coverage is blended in at a colour or a gradient.
  *
  * Coordinates are doubles in pixels with whole numbers on pixel edges.
  */
@@ -37,7 +38,6 @@
 #define PAINT_ORDER_ABGR 3
 
 #define PAINT_MAX_SIDE   32767
-#define PAINT_SAMPLES    16
 #define PAINT_RAMP_BYTES 1024
 #define PAINT_LIMIT      1073741824.0
 
@@ -79,5 +79,15 @@ int paint_round_rect(const paint_surface *s, paint_clip clip, double x0, double 
 int paint_round_ring(const paint_surface *s, paint_clip clip, double x0, double y0, double x1, double y1, const double r[4], double inset, int antialias, const paint_paint *paint, paint_box *box);
 int paint_shadow(const paint_surface *s, paint_clip clip, double x0, double y0, double x1, double y1, double radius, double blur, int antialias, const paint_paint *paint, paint_box *box);
 int paint_polyline(const paint_surface *s, paint_clip clip, const double *points, int count, int closed, const paint_paint *paint, paint_box *box);
+
+/* A gradient's ramp: for each of 256 steps x = i / 255, the last stop at or before x (stops walked forward), each
+ * channel interpolated straight to the next stop and rounded half up; before the first stop its colour, from the last
+ * on the last's. offsets are 0..1 and do not fall; colours are 0xRRGGBBAA. */
+void paint_ramp(const double *offsets, const uint32_t *colours, int count, uint8_t ramp[PAINT_RAMP_BYTES]);
+
+/* A gradient's matrix from pixel centres to its space, m as paint_paint's, from its geometry in a shape's units
+ * (PAINT_LINEAR: x0, y0, x1, y1; PAINT_RADIAL: cx, cy, r) and the transform the shape was drawn through, forward =
+ * a, b, c, d, e, f with x' = a x + c y + e, y' = b x + d y + f. 0 when the transform or the geometry cannot be undone. */
+int paint_gradient_matrix(int kind, const double *geometry, const double forward[6], double m[6]);
 
 #endif
